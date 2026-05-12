@@ -2,14 +2,22 @@
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
 #include "hardware/adc.h"
-#include <math.h>
 #include "lwip/ip4_addr.h"
+#include "lwip/netif.h"
 #include "lwip/tcp.h"
 #include "wifi_config.h"
 
+// Calibration: sensor outputs HIGH raw values when dry, LOW when wet.
+// Set MOISTURE_DRY to the stable raw reading in dry air.
+// Set MOISTURE_WET to the stable raw reading fully submerged in water.
+#define MOISTURE_DRY 2400
+#define MOISTURE_WET 1765
+#define MOISTURE_THRESHOLD 35.0f
 
+#define LED_PIN 15
 
-float current_temp = 0.0f;
+float current_moisture_pct = 0.0f;
+uint16_t current_raw_adc = 0;
 uint32_t current_free_memory = 0;
 
 static int wifi_connect_with_blink(const char *ssid, const char *pw, uint32_t auth, uint32_t timeout_ms) {
@@ -40,7 +48,6 @@ static int wifi_connect_with_blink(const char *ssid, const char *pw, uint32_t au
 }
 
 static void blink_error_forever() {
-    // 0.5 second period: 250ms on, 250ms off
     while (true) {
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
         sleep_ms(250);
@@ -55,23 +62,21 @@ uint32_t get_free_memory() {
     return stack_pointer - (uint32_t)&__StackLimit;
 }
 
-float read_temperature() {
-        // Read the raw ADC value, convert it to voltage, and then calculate the temperature
-        int32_t raw_reading = adc_read();
-        float voltage = raw_reading*3.3f/4096.0f;
-        float temperature =27.0f - (voltage - 0.706f) / 0.001721f;
-        
-        int temp_int = (int)roundf(temperature * 100); // Multiply by 100 to consider two decimal places
-        bool is_even = (temp_int % 2 == 0);
+void read_moisture() {
+    adc_select_input(1);
+    uint16_t raw = adc_read();
+    current_raw_adc = raw;
+    printf("Moisture raw: %u\n", raw);
 
-        printf("Temperature: %.2f\n", temperature);
-        printf(is_even ? "(EVEN)\n" : "(ODD)\n");
+    float pct = (float)(MOISTURE_DRY - raw) / (float)(MOISTURE_DRY - MOISTURE_WET) * 100.0f;
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 100.0f) pct = 100.0f;
 
-        current_free_memory = get_free_memory();
-        printf("Free memory: %d bytes\n", current_free_memory);
-        current_temp = temperature;
-        return temperature;
-    }
+    current_moisture_pct = pct;
+    current_free_memory = get_free_memory();
+
+    gpio_put(LED_PIN, pct < MOISTURE_THRESHOLD);
+}
 
 static err_t receive_callback(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
     if (p == NULL) {
@@ -81,34 +86,40 @@ static err_t receive_callback(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, e
 
     tcp_recved(tpcb, p->tot_len);
 
-    float temp = current_temp;
-
     char response[1024];
     int len;
-    
-    if (strstr(p->payload, "GET /temp") != NULL) {
+
+    if (strstr(p->payload, "GET /data") != NULL) {
         len = snprintf(response, sizeof(response),
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
-            "%.2f,%d",
-            temp, current_free_memory);
+            "%.1f,%u,%u",
+            current_moisture_pct, current_raw_adc, current_free_memory);
     } else {
         len = snprintf(response, sizeof(response),
             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
             "<html><body>"
-            "<h1>Pico W Temperature</h1>"
-            "<p>Temperature: <span id='t'>%.2f</span> C</p>"
-            "<p>Free memory: <span id='h'>%d</span> bytes</p>"
+            "<h1>Pico W Soil Moisture</h1>"
+            "<p>Moisture: <span id='m'>%.1f</span>%%</p>"
+            "<p>Raw ADC: <span id='r'>%u</span></p>"
+            "<p>Free memory: <span id='h'>%u</span> bytes</p>"
             "<script>"
+            "function update(v,r,h){"
+            "var s=document.getElementById('m');"
+            "s.textContent=v;"
+            "s.style.color=parseFloat(v)<35?'red':parseFloat(v)<50?'orange':'green';"
+            "document.getElementById('r').textContent=r;"
+            "document.getElementById('h').textContent=h;"
+            "}"
             "setInterval(function(){"
-            "fetch('/temp').then(r=>r.text()).then(d=>{"
-            "var parts=d.split(',');"
-            "document.getElementById('t').textContent=parts[0];"
-            "document.getElementById('h').textContent=parts[1];"
+            "fetch('/data').then(r=>r.text()).then(d=>{"
+            "var p=d.split(',');update(p[0],p[1],p[2]);"
             "});"
             "},2000);"
+            "update('%.1f','%u','%u');"
             "</script>"
             "</body></html>",
-            temp, current_free_memory);
+            current_moisture_pct, current_raw_adc, current_free_memory,
+            current_moisture_pct, current_raw_adc, current_free_memory);
     }
 
     tcp_write(tpcb, response, len, TCP_WRITE_FLAG_COPY);
@@ -118,7 +129,7 @@ static err_t receive_callback(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, e
     tcp_close(tpcb);
 
     return ERR_OK;
-}  
+}
 
 static void error_callback(void *arg, err_t err) {
     printf("TCP error: %d\n", err);
@@ -146,14 +157,13 @@ int main()
     stdio_init_all();
     sleep_ms(3000);
 
-    // Initialise the Wi-Fi chip
     if (cyw43_arch_init_with_country(CYW43_COUNTRY_USA) != 0) {
         printf("Wi-Fi init failed\n");
         return -1;
     }
 
-    // Connect to Wi-Fi network
     cyw43_arch_enable_sta_mode();
+    netif_set_hostname(netif_list, "pico-moisture");
 
     printf("Attempting to connect to Wi-Fi...\n");
 
@@ -167,7 +177,6 @@ int main()
         blink_error_forever();
     }
 
-    // Prints the IP address assigned to the device
     printf("Connected!\n");
     printf("IP Address: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_list)));
 
@@ -176,26 +185,27 @@ int main()
         blink_error_forever();
     }
 
-    // Connected and serving — LED solid on
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
 
-    // Initialise the ADC, enable the internal temperature sensor, and select the correct input
-    adc_init();
-    adc_set_temp_sensor_enabled(true);
-    adc_select_input(4);
+    gpio_init(LED_PIN);
+    gpio_set_dir(LED_PIN, GPIO_OUT);
+    gpio_put(LED_PIN, 0);
 
-    sleep_ms(3000); // Wait for the ADC to stabilize
+    // GPIO27 = ADC1 (pin 32 on Pico W) — GPIO26 is used by the CYW43 WiFi driver
+    adc_init();
+    adc_gpio_init(27);
+    adc_select_input(1);
+
+    sleep_ms(3000);
 
     int loop_count = 0;
-    while(true)
-    {
+    while (true) {
         cyw43_arch_poll();
         if (loop_count >= 10) {
-            read_temperature();
+            read_moisture();
             loop_count = 0;
         }
         loop_count++;
         sleep_ms(100);
     }
-
 }
